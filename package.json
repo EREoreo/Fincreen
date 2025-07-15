@@ -4,13 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "start:frontend": "vite",
     "start:backend": "node server.js",
-    
     "startt": "concurrently \"npm run start:backend\"  \"npm run start:frontend\""
   },
   "dependencies": {
@@ -23,7 +21,8 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.30.1",

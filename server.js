@@ -3,7 +3,10 @@ import express from 'express';
 import puppeteer from 'puppeteer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,14 +26,14 @@ const OFFSETS = Array.from(
   { length: Math.ceil(TOTAL / PER_PAGE) },
   (_, i) => (i === 0 ? 1 : i * PER_PAGE + 1)
 );
-const CONCURRENCY = 5;
+const CONCURRENCY = 3; // Уменьшено для Render
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function scrapeOffset(page, baseUrl, offset) {
   const url = offset === 1 ? baseUrl : `${baseUrl}&r=${offset}`;
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 0 });
-  await sleep(3000);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await sleep(2000); // Уменьшено для скорости
 
   const tickers = await page.$$eval(
     'a[href*="quote.ashx?t="]',
@@ -47,18 +50,31 @@ async function runScrapingJob(jobId, exchange) {
   const job = jobs.get(jobId);
   if (!job) return;
 
+  let browser;
   try {
     job.status = 'processing';
     
     const baseUrl = BASE_URLS[exchange] || BASE_URLS.nyse;
     
-    // Запускаем headless‑браузер
-    const browser = await puppeteer.launch({
+    // Конфигурация для Render
+    browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+      ],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     });
 
-    // Создаем пул из вкладок
+    // Создаем пул из вкладок (меньше для Render)
     const pages = await Promise.all(
       Array.from({ length: CONCURRENCY }, () => browser.newPage())
     );
@@ -95,8 +111,6 @@ async function runScrapingJob(jobId, exchange) {
       job.progress = Math.round((i + CONCURRENCY) / OFFSETS.length * 100);
     }
 
-    await browser.close();
-
     // Убираем USA, если попало
     all.delete('USA');
     const tickers = Array.from(all);
@@ -113,8 +127,15 @@ async function runScrapingJob(jobId, exchange) {
     console.error(`[${jobId}] Error:`, error);
     job.status = 'error';
     job.error = error.message;
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 }
+
+// Serve static files from dist directory
+app.use(express.static(path.join(__dirname, 'dist')));
 
 // Старый синхронный endpoint (для обратной совместимости)
 app.get('/api/finviz', async (req, res) => {
@@ -211,6 +232,11 @@ app.get('/api/finviz/download', (req, res) => {
   
   // Удаляем задачу после скачивания
   jobs.delete(jobId);
+});
+
+// Serve React app for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
 // Очистка старых задач (запускается каждые 10 минут)
