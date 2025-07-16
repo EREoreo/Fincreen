@@ -4,12 +4,22 @@ import puppeteer from 'puppeteer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import cors from 'cors';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Serve static files from dist folder in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, 'dist')));
+}
 
 // Хранилище задач в памяти (в продакшне используйте Redis)
 const jobs = new Map();
@@ -26,14 +36,14 @@ const OFFSETS = Array.from(
   { length: Math.ceil(TOTAL / PER_PAGE) },
   (_, i) => (i === 0 ? 1 : i * PER_PAGE + 1)
 );
-const CONCURRENCY = 3; // Уменьшено для Render
+const CONCURRENCY = 3; // Уменьшено для стабильности на Render
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function scrapeOffset(page, baseUrl, offset) {
   const url = offset === 1 ? baseUrl : `${baseUrl}&r=${offset}`;
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(2000); // Уменьшено для скорости
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(3000);
 
   const tickers = await page.$$eval(
     'a[href*="quote.ashx?t="]',
@@ -50,15 +60,14 @@ async function runScrapingJob(jobId, exchange) {
   const job = jobs.get(jobId);
   if (!job) return;
 
-  let browser;
   try {
     job.status = 'processing';
     
     const baseUrl = BASE_URLS[exchange] || BASE_URLS.nyse;
     
-    // Конфигурация для Render
-    browser = await puppeteer.launch({
-      headless: true,
+    // Настройки Puppeteer для Render
+    const browser = await puppeteer.launch({
+      headless: 'new',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -67,14 +76,11 @@ async function runScrapingJob(jobId, exchange) {
         '--no-first-run',
         '--no-zygote',
         '--single-process',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-features=VizDisplayCompositor'
-      ],
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        '--disable-gpu'
+      ]
     });
 
-    // Создаем пул из вкладок (меньше для Render)
+    // Создаем пул из вкладок
     const pages = await Promise.all(
       Array.from({ length: CONCURRENCY }, () => browser.newPage())
     );
@@ -101,7 +107,13 @@ async function runScrapingJob(jobId, exchange) {
       console.log(`[${jobId}] Scraping offsets: ${batch.join(', ')}`);
       
       const results = await Promise.all(
-        batch.map((offset, idx) => scrapeOffset(pages[idx], baseUrl, offset))
+        batch.map((offset, idx) => 
+          scrapeOffset(pages[idx % pages.length], baseUrl, offset)
+            .catch(err => {
+              console.error(`Error scraping offset ${offset}:`, err);
+              return [];
+            })
+        )
       );
       
       results.flat().forEach(t => all.add(t));
@@ -109,7 +121,12 @@ async function runScrapingJob(jobId, exchange) {
       
       // Обновляем прогресс
       job.progress = Math.round((i + CONCURRENCY) / OFFSETS.length * 100);
+      
+      // Небольшая пауза между батчами
+      await sleep(1000);
     }
+
+    await browser.close();
 
     // Убираем USA, если попало
     all.delete('USA');
@@ -127,17 +144,10 @@ async function runScrapingJob(jobId, exchange) {
     console.error(`[${jobId}] Error:`, error);
     job.status = 'error';
     job.error = error.message;
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 }
 
-// Serve static files from dist directory
-app.use(express.static(path.join(__dirname, 'dist')));
-
-// Старый синхронный endpoint (для обратной совместимости)
+// API Routes
 app.get('/api/finviz', async (req, res) => {
   const ex = (req.query.exchange || 'nyse').toLowerCase();
   const jobId = uuidv4();
@@ -174,12 +184,11 @@ app.get('/api/finviz', async (req, res) => {
   }
 });
 
-// Новые асинхронные endpoint'ы
+// Асинхронные endpoint'ы
 app.post('/api/finviz/start', async (req, res) => {
   const exchange = (req.query.exchange || 'nyse').toLowerCase();
   const jobId = uuidv4();
   
-  // Создаем задачу
   jobs.set(jobId, {
     id: jobId,
     exchange,
@@ -190,9 +199,7 @@ app.post('/api/finviz/start', async (req, res) => {
     createdAt: new Date()
   });
   
-  // Запускаем задачу асинхронно
   runScrapingJob(jobId, exchange);
-  
   res.json({ jobId });
 });
 
@@ -229,22 +236,27 @@ app.get('/api/finviz/download', (req, res) => {
     `attachment; filename="${job.exchange}-tickers.csv"`
   );
   res.send(job.result);
-  
-  // Удаляем задачу после скачивания
   jobs.delete(jobId);
 });
 
-// Serve React app for all other routes
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Очистка старых задач (запускается каждые 10 минут)
+// Serve React app for all other routes in production
+if (process.env.NODE_ENV === 'production') {
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  });
+}
+
+// Очистка старых задач
 setInterval(() => {
   const now = new Date();
   for (const [jobId, job] of jobs) {
-    const age = (now - job.createdAt) / 1000 / 60; // в минутах
-    if (age > 30) { // удаляем задачи старше 30 минут
+    const age = (now - job.createdAt) / 1000 / 60;
+    if (age > 30) {
       jobs.delete(jobId);
       console.log(`Cleaned up old job: ${jobId}`);
     }
@@ -253,4 +265,5 @@ setInterval(() => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });

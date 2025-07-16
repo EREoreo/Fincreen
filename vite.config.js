@@ -4,7 +4,9 @@ import tailwindcss from 'tailwindcss';
 import autoprefixer from 'autoprefixer';
 
 export default defineConfig({
-  plugins: [ react() ],
+  plugins: [
+    react(),
+  ],
   css: {
     postcss: {
       plugins: [
@@ -14,11 +16,8 @@ export default defineConfig({
     },
   },
   server: {
-    host: '0.0.0.0',
-    port: Number(process.env.PORT) || 5173,
-    // Разрешаем Vite‑dev принимать хост fincreen.onrender.com
-    allowedHosts: ['fincreen.onrender.com'],
     proxy: {
+      // Проксируем все запросы /api/* на ваш Express‑сервер на порту 3000
       '/api': {
         target: 'http://localhost:3000',
         changeOrigin: true,
@@ -26,4 +25,25 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    outDir: 'dist',
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom']
+        }
+      }
+    },
+    // Оптимизация для продакшена
+    minify: 'esbuild',
+    target: 'es2015'
+  },
+  // Базовый путь для статических файлов
+  base: '/',
+  // Настройки для предварительного просмотра
+  preview: {
+    port: 4173,
+    strictPort: true
+  }
 });
